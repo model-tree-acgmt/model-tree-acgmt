@@ -1,0 +1,76 @@
+Review of experiment code: acgmt.py, datasets.py, utils.py, experiments.py, ablations.py
+
+Findings
+
+1. High: The pruning logic is incorrect for non-root nodes.
+
+- In acgmt.py, pruning evaluates a subtree by calling _predict_bulk(node, X_val, np.arange(len(X_val)), val_preds).
+- That means the subtree rooted at the current node is used to predict the entire validation set, not just the validation samples that actually reach that node.
+- But the replacement leaf is trained only on build samples that do reach the node.
+- As a result, the subtree-versus-leaf comparison is inconsistent for every non-root node.
+- This makes the pruning experiment unreliable until the routing set for each node is tracked correctly on the validation set.
+
+2. Medium: The efficiency comparison against the original RHM is confounded by implementation differences.
+
+- ACGMT uses vectorized bulk prediction.
+- The original RHM baseline in code.py still predicts row-by-row using pandas DataFrames.
+- The experiment script times both fit and predict.
+- Therefore, part of the measured speedup over RHM comes from a faster implementation style, not necessarily from the proposed methodological enhancements.
+- Any runtime claim in the paper should either acknowledge this or use a prediction implementation that is comparable across methods.
+
+3. Medium: The reported memory numbers are not reliable for cross-model comparison.
+
+- utils.py uses tracemalloc to estimate peak memory.
+- tracemalloc tracks Python-level allocations but misses much of the native memory used by NumPy and scikit-learn.
+- This is especially problematic when comparing linear models, trees, and ensembles.
+- Memory results from peak_memory_mb should not be treated as strong evidence unless a better measurement method is used.
+
+4. Low: Runtime comparisons are not normalized for parallelism.
+
+- RandomForestRegressor is run with n_jobs=-1, while the other models are effectively single-threaded.
+- If wall-clock fit time is reported as a fairness comparison, this is not apples-to-apples.
+- Either force all models into a comparable single-thread setting where possible, or frame runtime as practical wall-clock throughput rather than algorithmic efficiency.
+
+5. Low: The full experiment suite does not appear to have been run yet.
+
+- The results directory currently contains top-k and standardization ablation outputs.
+- I do not yet see adaptive-grid ablation outputs, pruning ablation outputs, or the main comparison outputs.
+- So the current artifact set does not yet support the full four-enhancement story.
+
+What looks good
+
+- The file structure is sensible and easy to review.
+- The four claimed enhancements are genuinely represented in acgmt.py:
+  - node-wise standardization
+  - top-k feature preselection
+  - coarse-to-fine threshold refinement
+  - pruning
+- The dataset generators are clearly targeted at the intended failure modes and stress cases.
+- The ablation structure is conceptually sound.
+
+Recommended fixes before trusting the results
+
+1. Fix pruning evaluation.
+- For each node, evaluate subtree and leaf performance only on validation samples that actually reach that node.
+- This requires routing validation indices through the tree during pruning, not reusing the entire validation set at every internal node.
+
+2. Make RHM prediction timing comparable.
+- Either vectorize the original RHM prediction path or report fit-time and predict-time separately with an explicit note that prediction implementations differ.
+
+3. Improve memory measurement.
+- If memory is important to the paper, replace tracemalloc-only reporting with a process-level peak memory measurement.
+- Otherwise, remove strong memory claims.
+
+4. Normalize runtime comparisons.
+- Use comparable threading settings where possible, or clearly state that Random Forest uses all cores while the others do not.
+
+5. Re-run the complete experiment suite after fixes.
+- main comparisons
+- top-k ablation
+- standardization ablation
+- adaptive-grid ablation
+- pruning ablation
+
+Bottom line
+
+The experiment code is structurally strong and the proposed method is implemented in a real way, not just nominally. The main blocker is the pruning bug, because it directly affects one of the central claimed enhancements. After that is fixed, the next priority is tightening the fairness of runtime and memory reporting.

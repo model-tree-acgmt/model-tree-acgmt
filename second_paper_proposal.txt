@@ -1,0 +1,37 @@
+Second Paper Prospectus
+
+Working title
+
+Adaptive Coefficient-Guided Model Trees: Efficient Piecewise Linear Regression with Robust Split Selection
+
+Motivation
+
+The current paper establishes a minimal coefficient-guided model tree as a clean and interpretable baseline, but its main limitation is that the split-selection heuristic is too brittle to support a strong methodological claim. Selecting only the single largest Ridge coefficient at each node is computationally attractive, yet it is sensitive to feature scaling, collinearity, and local estimation noise. The next paper should therefore not repackage the same method. Instead, it should ask a sharper question: can coefficient-guided model trees be made robust enough to recover much of the predictive benefit of exhaustive model-tree search while preserving lower computational cost and interpretability?
+
+Central idea
+
+The second paper will introduce an adaptive coefficient-guided search framework for piecewise linear regression trees. The key design principle is to treat Ridge coefficients not as a final split decision, but as a fast screening mechanism that narrows the split search to a small, promising subset of features. Rather than committing to only the top-ranked feature, the proposed method will standardize features locally, rank them by coefficient magnitude, evaluate the top-k candidates, and then perform a more refined threshold search only within that restricted set. This preserves the computational motivation of the original approach while making split selection substantially more stable and defensible.
+
+Methodological contributions
+
+The paper should make four concrete contributions. First, it will introduce node-wise feature standardization so coefficient magnitudes become comparable and less scale-dependent. Second, it will replace single-feature selection with top-k coefficient-guided feature preselection, allowing the method to trade small additional computation for better split quality. Third, it will replace the fixed percentile threshold grid with an adaptive threshold search procedure, such as coarse-to-fine quantile refinement or histogram-guided local search. Fourth, it will incorporate validation-aware stopping or pruning so the tree does not rely only on externally chosen depth limits. Together, these changes define a new algorithmic family rather than a one-off heuristic.
+
+Core claim
+
+The paper should argue that adaptive coefficient-guided model trees occupy a useful middle ground between exhaustive model-tree search and cheap but unstable heuristics. The goal is not to claim a new model class, but to demonstrate a better accuracy-computation tradeoff. In particular, the paper should test whether coefficient-guided preselection can recover most of the predictive performance of exhaustive split search at a fraction of the runtime. That is the claim that would make the work methodologically interesting.
+
+Experimental plan
+
+The empirical section must be substantially stronger than in the first paper. It should include synthetic experiments designed to isolate scaling sensitivity, correlated predictors, irrelevant features, regime changes, and interaction effects. It should also include comparisons against a global Ridge baseline, CART-style regression trees, at least one existing model-tree implementation, and a standard ensemble baseline such as Random Forest or Gradient Boosting. Ablations should compare top-1 versus top-k feature screening, fixed-grid versus adaptive threshold search, and pruning versus no pruning. Runtime and memory measurements must be reported alongside predictive metrics, because the main claim is about efficiency-performance tradeoffs, not just raw accuracy.
+
+Expected paper structure
+
+The paper can be structured around a single narrative arc. The introduction motivates efficient model-tree search. The method section defines adaptive coefficient-guided splitting. The theory section gives time-complexity comparisons and discusses robustness under scaling and collinearity. The experiments section evaluates the proposed variants against exhaustive and baseline alternatives. The discussion section interprets when coefficient-guided screening helps and when exhaustive search is still necessary.
+
+What would make the paper publishable
+
+This follow-up paper becomes credible if it demonstrates three things clearly. First, the adaptive variants must consistently outperform the original top-1 heuristic. Second, they must approach the predictive quality of stronger model-tree baselines. Third, they must preserve a visible computational advantage over exhaustive search. If those three conditions are met, the paper has a real contribution: not a new paradigm, but a practical and analyzable search strategy for efficient piecewise linear trees.
+
+Bottom line
+
+The second paper should be positioned as a study of robust and adaptive coefficient-guided model-tree construction, with the original RHM serving as the simplest member of that family. That framing gives the work a clearer novelty claim, a stronger experimental agenda, and a more defensible place in the model-tree literature.

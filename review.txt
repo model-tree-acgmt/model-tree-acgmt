@@ -1,0 +1,95 @@
+Review of paper.tex, paper.txt, and code.py
+
+Findings
+
+1. High: The manuscript's analytical examples are not faithful to the implemented algorithm, and the paper contradicts itself on continuity.
+
+- The paper states that RHM does not enforce continuity and may be discontinuous at split boundaries.
+- Later sections present 1D and 2D examples claiming exact continuity of adjacent leaf models and an O(h^2) convergence picture.
+- The implementation does not enforce continuity. It uses sampled-data Ridge fits with alpha=1.0 and percentile-grid split search.
+- I checked the 12-point 1D example from the paper against the code. The implementation does split at 0.0, but the fitted leaf equations and MSE values do not match the manuscript's numbers. That means the worked example reads like an idealized analytical construction, not a reproduction of the implemented method.
+
+2. High: The claim that the implementation is "fully compatible with the scikit-learn API" is false.
+
+- fit returns a HybridNode rather than self.
+- fit does not assign self.root.
+- predict only works if the caller manually does model.root = model.fit(...), which the script does internally.
+- A normal sklearn-style call sequence model.fit(X, y); model.predict(X) fails.
+
+3. Medium: The implementation is pandas-specific, which conflicts with both the paper's matrix notation and its sklearn-style positioning.
+
+- The model assumes X.columns, X.index, and X.loc exist.
+- Passing a NumPy array fails.
+- That is fine for a local prototype, but not for a paper claiming sklearn compatibility.
+
+4. Medium: The compiled paper artifact appears stale relative to the LaTeX source.
+
+- paper.tex contains a filled results table with concrete metrics.
+- paper.txt still shows dashes and placeholder text saying values remain to be filled.
+- If paper.pdf matches the stale artifact, readers will see an incomplete results section.
+
+5. Medium: The qualitative leaf-coefficient discussion does not match the generated artifact.
+
+- The paper discusses a high-x1 / high-x2 partition at depth 2.
+- The generated hybrid_coefficients.csv from the current run shows a depth-2 tree splitting only on feature_1 twice.
+- That narrative should either be updated to match the observed tree or be marked explicitly as a hypothetical interpretation.
+
+Assessment of the approach
+
+There is real value in the approach.
+
+- The core idea is sensible: use a cheap global linear signal to choose a split axis, then fit local linear models inside the induced regions.
+- That gives a useful midpoint between a single global Ridge model and a more expensive exhaustive model-tree search.
+- The approach is interpretable, easy to explain, and suitable as a pedagogical baseline or research prototype for studying coefficient-guided splitting.
+
+Where the contribution currently sits
+
+- The contribution is in the heuristic and the simplicity.
+- It is a credible baseline and a potentially useful practical shortcut.
+- It is not yet supported strongly enough to justify broad claims of methodological strength beyond the synthetic setting used here.
+
+Recommended next steps
+
+1. Make the implementation actually sklearn-style:
+- fit should assign self.root and return self.
+- predict should work after a normal fit call.
+- Accept both pandas DataFrames and NumPy arrays.
+
+2. Bring the paper into alignment with the implementation:
+- Remove or clearly label the idealized analytical examples if they are not direct outputs of the algorithm.
+- Resolve the continuity contradiction.
+- Ensure all reported numbers come from reproducible runs of the current code.
+
+3. Strengthen the empirical case:
+- Compare against at least one standard model-tree baseline and one tree ensemble baseline.
+- Test sensitivity to feature scaling, correlated features, and percentile-grid resolution.
+- Add ablations for coefficient-guided feature choice versus exhaustive or random-subset feature search.
+
+Bottom line
+
+The idea has value as a clean, interpretable, low-complexity model-tree variant. The main issue is not that the approach is useless; it is that the paper currently claims more precision and alignment with the implementation than the evidence supports.
+
+Update after re-review
+
+Most of the earlier issues are now fixed.
+
+- The code now follows the scikit-learn estimator pattern: fit returns self, stores self.root, and predict works after a normal fit call.
+- The implementation now accepts both pandas DataFrames and NumPy arrays.
+- The manuscript now clarifies that continuity is not guaranteed in the implemented hard-routing model, and that the continuity claims in the example section apply only to an idealized analytical setting.
+- The qualitative discussion of the depth-2 leaves now matches the observed tree structure: repeated splits on x1 produce vertical strips rather than a two-feature grid.
+
+Remaining issues
+
+1. Medium: Algorithm 1 in the manuscript no longer matches the public API implemented in code.
+
+- The paper states that the implementation follows the scikit-learn estimator interface.
+- The code now does that.
+- But Algorithm 1 still presents RHM.fit(X, y, depth) as a recursive routine returning a HybridNode.
+- That description now corresponds to the internal tree-building procedure, not to the public fit method exposed by the estimator.
+
+2. Low: The analytical example is improved but still slightly ambiguous.
+
+- The paper now states that the coefficients and error bounds in the example section are analytical and population-level rather than exact sampled outputs.
+- That fixes the main conceptual problem.
+- Still, the setup begins by introducing a finite sample and then gives exact closed-form coefficients and MSE values, which may still read as though they came directly from a run of the implementation.
+- This would be cleaner if the section were labelled even more explicitly as an idealized analytical illustration rather than an empirical reproduction.

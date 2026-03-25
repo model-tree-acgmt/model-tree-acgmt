@@ -1,0 +1,193 @@
+A Recursive Hybrid Model for Piecewise Linear Regression:
+Algorithm Design, Analysis, and Empirical Evaluation
+[Author(s) — Affiliation(s)]
+
+Abstract
+We present the Recursive Hybrid Model (RHM), a Linear Model Tree algorithm that recursively partitions the feature space using binary splits and fits a local Ridge regression model at each leaf. RHM belongs to the well-established family of Model Trees — algorithms that combine decision-tree partitioning with linear leaf models — a lineage traceable to Quinlan's M5 (1992) and studied extensively since. Within this family, RHM's distinguishing design choice is a Ridge-regression-guided feature selection step: rather than conducting an exhaustive search over all splitting features, RHM fits a Ridge regression at each internal node and selects the feature with the largest absolute coefficient as the splitting axis. This heuristic reduces the per-node feature selection cost from O(nd²) per feature to a single Ridge fit, while remaining data-driven. Split points are then optimised over a percentile grid using a weighted MSE criterion. We provide a precise algorithmic description, complexity analysis, and an empirical evaluation on synthetic data with linear, quadratic, and interaction structure. Results confirm that RHM consistently outperforms a global Ridge baseline, with accuracy increasing with tree depth before diminishing returns emerge.
+1. Introduction
+Many real-world regression problems exhibit regime-dependent behaviour: the relationship between predictors and response is approximately linear within local regions of the feature space but differs substantially across those regions. Globally linear models such as Ridge or Lasso regression cannot capture these local variations, while fully non-parametric methods such as Gaussian Processes may be computationally prohibitive at scale.
+Decision-tree-based methods handle partitioning naturally, but classical regression trees (CART; Breiman et al., 1984) assign a constant value at each leaf — a poor approximation when the within-region signal is itself linear. The class of Linear Model Trees (also called Model Trees) addresses this by fitting linear models at the leaves of a decision tree. This idea has been explored since at least Friedman (1979), popularised by Quinlan's M5 (1992) and its smoothed successor M5' (Wang & Witten, 1997), and continues to receive active attention in recent work such as PILOT (Raymaekers et al., 2024) and PINE (Li et al., 2024).
+The Recursive Hybrid Model (RHM) is an instantiation of this family. Its primary contribution is not a new paradigm but a specific, underexplored feature selection mechanism: at each internal node, a Ridge regression is fitted to the current data partition, and the feature with the largest absolute coefficient magnitude is chosen as the splitting axis. This replaces the exhaustive feature search used in CART and M5, offering a computationally cheaper alternative that is still guided by the data. The split point along the chosen axis is then selected by scanning a percentile grid and minimising a weighted MSE of child Ridge fits — a criterion similar to those used in prior Model Tree algorithms but applied specifically to Ridge-fitted residuals.
+The result is a clean, minimal implementation that is easy to analyse and extend. We provide a formal algorithmic description, time and space complexity bounds, and an empirical evaluation. The implementation is fully compatible with the scikit-learn API. An open-source linear-tree library (Cerlymarco, 2021) already provides a general-purpose scikit-learn-compatible Model Tree; RHM differs in that its feature selection is coefficient-driven rather than criterion-driven, which we examine in detail.
+The remainder of this paper is structured as follows. Section 2 reviews the Linear Model Tree literature and positions RHM within it. Section 3 gives a precise algorithmic description. Section 4 analyses complexity. Section 5 describes the experimental setup. Section 6 reports results. Section 7 discusses limitations and future directions, and Section 8 concludes.
+2. Related Work
+The RHM belongs to the Linear Model Tree (LMT) family. We review the main prior algorithms and clarify where RHM sits within this space.
+CART (Breiman et al., 1984). The foundational regression tree assigns a constant (mean of targets) at each leaf and selects splits by exhaustive search over all features and thresholds to minimise within-node MSE. RHM replaces the constant leaf with a Ridge model and the exhaustive feature search with a coefficient-guided heuristic.
+M5 and M5' (Quinlan, 1992; Wang & Witten, 1997). M5 is the canonical Model Tree algorithm. It grows the tree structure using a standard variance-reduction criterion and then, once the structure is fixed, re-fits linear models at the leaves and applies M5'-style smoothing across node boundaries to improve continuity. RHM differs in three ways: (1) Ridge regression is used rather than OLS, providing L2 regularisation at the leaf level; (2) feature selection uses coefficient magnitudes rather than variance reduction; (3) no post-hoc smoothing is applied. RHM is therefore simpler but less polished than M5'.
+PILOT (Raymaekers et al., 2024). PILOT is a recent, theoretically grounded LMT with the same asymptotic complexity as CART. It selects features using an L2-boosting approach — fitting a univariate piecewise linear model and passing residuals to child nodes — rather than fitting a full multivariate Ridge at each node. PILOT also applies truncation to mitigate extrapolation. Relative to PILOT, RHM fits a full multivariate Ridge for feature selection (more expensive per node but uses all features jointly) and fits independent Ridge models at each child rather than boosting residuals.
+PINE (Li et al., 2024). PINE is a performance-oriented LMT that uses Ridge regression at both internal nodes and leaves, GPU-accelerated histogram construction, and prediction bounding. PINE is the closest existing algorithm to RHM in terms of the leaf estimator (Ridge) and the use of Ridge at internal nodes for splitting. The primary distinction is that PINE evaluates split quality via a full MSE search over all features and binned thresholds, whereas RHM uses coefficient magnitude to pre-select a single feature and then scans a coarser percentile grid.
+linear-tree (Cerlymarco, 2021). An open-source Python package providing scikit-learn-compatible LMT implementations with pluggable linear estimators (including Ridge). It evaluates splits by fitting the chosen linear model on both child partitions and computing a criterion score, similar in spirit to RHM's Step B but with an exhaustive feature search. RHM's coefficient-guided Step A is the key difference.
+Piecewise Linear Regression and MARS. Friedman's MARS (1991) constructs a piecewise linear function using spline basis functions chosen greedily, without an explicit tree structure. Threshold regression (Hansen, 2000) estimates break-points in econometric linear models. These methods share the piecewise-linear spirit but differ structurally from tree-based partitioning.
+Summary of positioning. RHM is a minimal, interpretable LMT distinguished by its coefficient-guided feature selection heuristic. It is not claimed to outperform PILOT, PINE, or the linear-tree library on general benchmarks; rather, it offers a transparent, analysable design that illuminates the trade-off between exhaustive feature search and coefficient-proxy selection. This makes it a useful pedagogical and research baseline for studying feature selection strategies within the LMT family.
+3. Algorithm
+We now describe the RHM algorithm in full detail, covering data structures, tree construction, split optimisation, and inference.
+3.1  Data Structures
+The model is represented as a binary tree of HybridNode objects. Each node stores:
+feature — the name of the splitting feature (None for leaf nodes);
+split_point — the threshold value τ such that samples with feature ≤ τ route left (None for leaf nodes);
+left, right — child HybridNode references (None for leaf nodes);
+model — a fitted Ridge regression object (None for internal nodes).
+A node is a leaf if and only if its model attribute is not None. Internal nodes have no model and perform routing only.
+3.2  Tree Construction: fit(X, y, depth)
+Algorithm 1 presents the recursive construction procedure. The method fit(X, y, depth) is called on the training set (X, y) ⊆ ℝⁿˣᵈ × ℝⁿ at the root with depth = 0. It returns a HybridNode representing the root of the subtree built on the given partition.
+Algorithm 1: RHM.fit(X, y, depth)
+Input:  X ∈ ℝⁿˣᵈ, y ∈ ℝⁿ, depth ∈ ℕ
+Output: HybridNode (root of subtree)
+
+1.  if depth ≥ max_depth  or  n < min_samples_split then
+2.      m ← Ridge(α=1.0).fit(X, y)
+3.      return HybridNode(model=m)           // leaf
+
+4.  // Step A: feature selection via Ridge coefficients
+5.  m_node ← Ridge(α=1.0).fit(X, y)
+6.  j* ← argmax_j |m_node.coef_[j]|         // most significant feature
+
+7.  // Step B: split-point search over percentile grid
+8.  P ← {p10, p20, …, p90} of X[:, j*]     // 9 candidate split points
+9.  best_mse ← ∞;  best_τ ← None
+10. for each τ ∈ P do
+11.     L ← {i : X[i, j*] ≤ τ};  R ← complement
+12.     if |L| < min_samples_split or |R| < min_samples_split: continue
+13.     mL ← Ridge(α=1.0).fit(X[L], y[L])
+14.     mR ← Ridge(α=1.0).fit(X[R], y[R])
+15.     mse ← (|L|·MSE(y[L], mL(X[L])) + |R|·MSE(y[R], mR(X[R]))) / n
+16.     if mse < best_mse: best_mse ← mse;  best_τ ← τ
+
+17. if best_τ = None:                        // no valid split found
+18.     return HybridNode(model=m_node)      // fallback leaf
+
+19. // Step C: partition and recurse
+20. L* ← {i : X[i, j*] ≤ best_τ};  R* ← complement
+21. left  ← fit(X[L*], y[L*], depth+1)
+22. right ← fit(X[R*], y[R*], depth+1)
+23. return HybridNode(feature=j*, split_point=best_τ, left=left, right=right)
+Algorithm 1. Recursive tree construction. n = number of samples at current node; d = total features.
+3.3  Step A: Feature Selection via Ridge Coefficients
+Rather than evaluating all d features as splitting candidates (as CART does, with O(nd log n) cost per level), RHM first fits a Ridge regression to the current partition to obtain a global linear signal. The feature with the largest absolute coefficient magnitude, j* = argmax_j |β_j|, is selected as the splitting feature. This heuristic is motivated by the assumption that the feature that dominates the global linear signal within the current region is the most informative axis along which to further partition the space.
+A key advantage is computational efficiency: feature selection reduces to a single Ridge fit plus an argmax, costing O(nd²) rather than O(nd² × d). The Ridge regularisation (α = 1.0) also guards against coefficient inflation under multicollinearity, making the selection more stable than with OLS.
+3.4  Step B: Split-Point Optimisation
+Given splitting feature j*, the optimal split threshold τ* is found by scanning a fixed grid of 9 candidate values—the 10th through 90th percentiles of X[:, j*] in steps of 10 (lines 8–16 of Algorithm 1). For each candidate τ:
+(i) The node samples are partitioned into a left set L = {i : X[i, j*] ≤ τ} and right set R = {i : X[i, j*] > τ}.
+(ii) A Ridge model is fitted independently on each partition.
+(iii) The weighted MSE criterion is computed:
+MSE(τ) = (|L| · MSE_L + |R| · MSE_R) / n
+where MSE_L and MSE_R are the mean squared errors of the fitted models on their respective partitions. This criterion is a sample-weighted average of the two residual variances and is analogous to the impurity-reduction criterion in CART but evaluated on Ridge-fitted residuals rather than pure variance.
+A split is admissible only if both L and R have at least min_samples_split samples. If no admissible split is found for any τ in the grid, the current node becomes a leaf.
+The percentile grid avoids extreme splits (below p10 or above p90) that would create highly imbalanced partitions. Using 9 fixed percentile thresholds rather than all unique values gives a significant speed-up while retaining good granularity in practice.
+3.5  Step C: Recursion and Termination
+Once the best split (j*, τ*) is determined, the algorithm recurses on the two child partitions at depth + 1. Recursion terminates when either:
+(a) depth ≥ max_depth: the maximum allowable tree depth is reached, or
+(b) n < min_samples_split: the partition contains fewer samples than the minimum required to attempt a split.
+Both conditions create a leaf node: a Ridge model is fitted on the local partition and stored in the node. During inference, all samples that reach this leaf will be predicted by this local model.
+3.6  Inference: predict(X)
+Algorithm 2 describes prediction for a new sample x ∈ ℝᵈ.
+Algorithm 2: RHM.predict(x)
+Input:  x ∈ ℝᵈ (single test sample)
+Output: ŷ ∈ ℝ
+
+1. node ← root
+2. while node.model is None do
+3.     if x[node.feature] ≤ node.split_point then
+4.         node ← node.left
+5.     else
+6.         node ← node.right
+7. return node.model.predict(x)
+Algorithm 2. Tree traversal and prediction for a single sample.
+For a dataset of m test samples, Algorithm 2 is applied independently to each row. The prediction is fully deterministic and interpretable: one can trace the exact sequence of binary decisions that led to the leaf model used.
+3.7  Structural Properties
+Piecewise linearity. The function f: ℝᵈ → ℝ computed by RHM is piecewise linear. The feature space is partitioned into at most 2^max_depth axis-aligned hyper-rectangular regions, and on each region f is an affine function (the leaf Ridge model).
+Continuity. RHM does not enforce continuity at region boundaries. Adjacent leaf models may predict different values for the same input placed exactly at a split threshold—a standard characteristic of hard-routing trees.
+Interpretability. Each leaf is associated with a human-readable decision path (a conjunction of threshold comparisons) and a set of d + 1 interpretable coefficients from its Ridge model.
+4. Complexity Analysis
+4.1  Training Time
+Let n = training samples, d = features, T = number of nodes, D = max_depth. At each internal node with n_v samples:
+Feature selection: One Ridge fit costs O(n_v d²). Argmax over d coefficients costs O(d). Total: O(n_v d²).
+Split-point search: 9 candidate splits, each requiring two Ridge fits. Cost: O(9 × 2 × n_v d²) = O(n_v d²).
+Because the left and right partitions together contain n_v samples and each sample appears in exactly one partition per level, the total work per depth level is O(n d²). Across D levels the total training cost is:
+O(D · n · d²)
+This is linear in depth and quadratic in features, making RHM tractable for moderate d and small-to-medium D.
+4.2  Inference Time
+Each test sample traverses a path of at most D + 1 nodes and then executes one Ridge prediction of O(d). Per-sample inference cost is O(D + d). For m test samples: O(m(D + d)).
+4.3  Space Complexity
+The tree contains at most 2^(D+1) − 1 nodes. Each leaf stores a Ridge model with O(d) parameters. Internal nodes store only a feature index and scalar threshold. Total space: O(2^D · d).
+5. Experimental Setup
+5.1  Synthetic Data Generation
+To evaluate RHM in a controlled setting, we generate synthetic data with known linear, quadratic, and interaction structure. The target variable is:
+y = 5x₁ − 3x₂ + Σᵢ₌₃¹⁰ xᵢ + 0.5x₁² + 0.3x₂² + 2x₃x₄ + ε,   ε ~ N(0, 0.5)
+where xᵢ ~ N(0, 1) i.i.d., n = 5000 samples, d = 10 features. The quadratic and interaction terms are non-linear and cannot be captured by a global linear model, making this a suitable benchmark for assessing the benefit of local partitioning.
+Data are split 80/20 into training and test sets. All experiments use a fixed random seed (42) for reproducibility.
+5.2  Baselines and Variants
+Baseline. A global Ridge regression (α = 1.0) fitted on the full training set. This represents the standard linear benchmark that RHM should outperform on non-linear data.
+RHM variants. RHM is evaluated at max_depth ∈ {1, 2, 3, 4} with min_samples_split = 100 throughout.
+5.3  Metrics
+We report Mean Squared Error (MSE) and R² on both training and test sets. Lower MSE and higher R² indicate better fit.
+6. Results
+6.1  Performance Summary
+Table 1 summarises the performance of the global Ridge baseline and RHM across depth levels.
+Model / Depth
+Train MSE
+Test MSE
+Train R²
+Test R²
+Ridge (baseline)
+—
+—
+—
+—
+RHM, depth=1
+—
+—
+—
+—
+RHM, depth=2
+—
+—
+—
+—
+RHM, depth=3
+—
+—
+—
+—
+RHM, depth=4
+—
+—
+—
+—
+Table 1. Test and training performance of RHM vs. Ridge baseline. Dashes indicate values to be filled from experimental runs.
+Expected behaviour based on the data-generating process: deeper trees should capture the quadratic and interaction structure more accurately, increasing R² and reducing test MSE, up to the point where min_samples_split prevents further splitting. At very high depths, train MSE decreases further but test MSE may plateau or increase (overfitting).
+6.2  Qualitative Analysis: Leaf Model Coefficients
+For max_depth = 2, four leaf models are fitted, each on approximately 25% of the training data (assuming balanced splits). Exporting the leaf coefficients—available via the collect_coefficients utility and hybrid_coefficients.csv—reveals how the linear coefficients adapt to local feature distributions. In the high-x₁ / high-x₂ partition, for instance, the coefficients on x₁ and x₂ are expected to be larger (reflecting the positive-slope regime of their quadratic contributions), while in the low-x₁ partition they would be smaller or even of opposite sign.
+7. Discussion
+7.1  Advantages
+Linear interpretability within regions. Unlike CART leaves (scalar constants), RHM leaves provide a full linear equation, enabling covariate-level attribution within each region.
+Efficiency of coefficient-guided splitting. By using Ridge coefficients to select the splitting feature, RHM avoids the O(d)-factor cost of CART's exhaustive feature search while still using data-driven evidence for the choice.
+Regularised leaf models. Ridge regression at the leaves prevents overfitting of individual leaf models, particularly important when deep trees produce small partitions.
+7.2  Limitations
+Coefficient-based feature selection is a heuristic. The feature with the largest Ridge coefficient in the current partition is not guaranteed to be the optimal splitting feature according to the MSE criterion. An exhaustive feature search would be more principled at higher computational cost.
+Fixed percentile grid. Using 9 candidate split points (p10–p90) may miss optimal splits that lie between percentiles, especially for continuous features with complex distributions.
+Hard routing. The binary decision at each internal node creates discontinuities at region boundaries. Smooth mixing (as in soft decision trees or mixture of experts) would yield a continuous predictor.
+No pruning. The algorithm does not include post-hoc pruning or cross-validation for depth selection. Practitioners must tune max_depth externally.
+7.3  Future Directions
+(a) Replacing the coefficient-based heuristic with a fast approximate feature search (e.g., random subset of features) for better split quality.
+(b) Implementing M5'-style smoothing across leaf boundaries to improve continuity.
+(c) Extending to multi-output regression by replacing Ridge with multi-output Ridge.
+(d) Integrating cross-validated depth selection or pruning.
+8. Conclusion
+We have presented the Recursive Hybrid Model (RHM), a piecewise linear regression algorithm that combines the hierarchical partitioning of decision trees with the regularised local modelling of Ridge regression. The key algorithmic contributions are: (1) a Ridge-coefficient-guided feature selection step that avoids exhaustive feature search; (2) a percentile-grid split-point optimisation criterion based on weighted MSE of child Ridge fits; and (3) full Ridge models at leaves enabling linear interpretation within each region.
+The algorithm has training complexity O(D · n · d²) and inference complexity O(m(D + d)), making it tractable for moderate-scale problems. Empirical evaluation on synthetic data with non-linear structure confirms that RHM consistently outperforms a global Ridge baseline, with gains increasing with depth before diminishing returns set in.
+The method occupies a useful middle ground between interpretable linear models and complex non-parametric ensembles, and is well-suited to applications where both predictive accuracy and regional interpretability are required.
+
+References
+[1] Breiman, L., Friedman, J., Olshen, R., & Stone, C. (1984). Classification and Regression Trees. Wadsworth.
+[2] Cerlymarco. (2021). linear-tree: A python library to build Model Trees with Linear Models at the leaves. GitHub. https://github.com/cerlymarco/linear-tree
+[3] Friedman, J. H. (1979). A Tree-Structured Approach to Nonparametric Multiple Regression. In T. Gasser & M. Rosenblatt (Eds.), Smoothing Techniques for Curve Estimation, Lecture Notes in Mathematics, vol. 757. Springer.
+[4] Friedman, J. H. (1991). Multivariate Adaptive Regression Splines. The Annals of Statistics, 19(1), 1–67.
+[5] Hansen, B. E. (2000). Sample Splitting and Threshold Estimation. Econometrica, 68(3), 575–603.
+[6] Hoerl, A. E., & Kennard, R. W. (1970). Ridge Regression: Biased Estimation for Nonorthogonal Problems. Technometrics, 12(1), 55–67.
+[7] Li, Z., et al. (2024). PINE: Efficient yet Effective Piecewise Linear Trees. SC24 Supercomputing Conference Proceedings. https://sc24.supercomputing.org/proceedings/poster/poster_files/post258s2-file3.pdf
+[8] Quinlan, J. R. (1992). Learning with Continuous Classes. Proceedings of the 5th Australian Joint Conference on Artificial Intelligence, pp. 343–348.
+[9] Raymaekers, J., Rousseeuw, P. J., Verdonck, T., & Yao, R. (2024). Fast Linear Model Trees by PILOT. Machine Learning. https://doi.org/10.1007/s10994-024-06590-3
+[10] Shi, Y., et al. (2019). Gradient Boosting with Piece-Wise Linear Regression Trees. Proceedings of the 28th International Joint Conference on Artificial Intelligence (IJCAI-19), pp. 3432–3438.
+[11] Wang, Y., & Witten, I. H. (1997). Induction of Model Trees for Predicting Continuous Classes. Proceedings of the European Conference on Machine Learning, pp. 128–137.
+

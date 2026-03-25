@@ -1,0 +1,754 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{float}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage[margin=1in]{geometry}
+\usepackage{natbib}
+\usepackage{graphicx}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+
+\title{A Recursive Hybrid Model for Piecewise Linear Regression:\\
+Algorithm Design, Analysis, and Empirical Evaluation}
+
+\author{[Author(s) --- Affiliation(s)]}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present the Recursive Hybrid Model (RHM), a Linear Model Tree algorithm that recursively partitions the feature space using binary splits and fits a local Ridge regression model at each leaf. RHM belongs to the well-established family of Model Trees---algorithms that combine decision-tree partitioning with linear leaf models---a lineage traceable to Quinlan's M5 (1992) and studied extensively since. Within this family, RHM's distinguishing design choice is a Ridge-regression-guided feature selection step: rather than conducting an exhaustive search over all splitting features, RHM fits a Ridge regression at each internal node and selects the feature with the largest absolute coefficient as the splitting axis. This heuristic reduces the per-node feature selection cost from $O(nd^2)$ per feature to a single Ridge fit, while remaining data-driven. Split points are then optimised over a percentile grid using a weighted MSE criterion. We provide a precise algorithmic description, complexity analysis, and an empirical evaluation on synthetic data with linear, quadratic, and interaction structure. Results confirm that RHM consistently outperforms a global Ridge baseline, with accuracy increasing with tree depth before diminishing returns emerge.
+\end{abstract}
+
+\section{Introduction}
+
+Many real-world regression problems exhibit regime-dependent behaviour: the relationship between predictors and response is approximately linear within local regions of the feature space but differs substantially across those regions. Globally linear models such as Ridge or Lasso regression cannot capture these local variations, while fully non-parametric methods such as Gaussian Processes may be computationally prohibitive at scale.
+
+Decision-tree-based methods handle partitioning naturally, but classical regression trees (CART; \citealt{breiman1984}) assign a constant value at each leaf---a poor approximation when the within-region signal is itself linear. The class of Linear Model Trees (also called Model Trees) addresses this by fitting linear models at the leaves of a decision tree. This idea has been explored since at least \citet{friedman1979}, popularised by Quinlan's M5 \citep{quinlan1992} and its smoothed successor M5' \citep{wang1997}, and continues to receive active attention in recent work such as PILOT \citep{raymaekers2024} and PINE \citep{li2024}.
+
+The Recursive Hybrid Model (RHM) is an instantiation of this family. Its primary contribution is not a new paradigm but a specific, underexplored feature selection mechanism: at each internal node, a Ridge regression is fitted to the current data partition, and the feature with the largest absolute coefficient magnitude is chosen as the splitting axis. This replaces the exhaustive feature search used in CART and M5, offering a computationally cheaper alternative that is still guided by the data. The split point along the chosen axis is then selected by scanning a percentile grid and minimising a weighted MSE of child Ridge fits---a criterion similar to those used in prior Model Tree algorithms but applied specifically to Ridge-fitted residuals.
+
+The result is a clean, minimal implementation that is easy to analyse and extend. We provide a formal algorithmic description, time and space complexity bounds, and an empirical evaluation. The implementation follows the scikit-learn estimator interface (\texttt{fit} returns \texttt{self}; \texttt{predict} accepts both NumPy arrays and pandas DataFrames). An open-source \texttt{linear-tree} library \citep{cerlymarco2021} already provides a general-purpose scikit-learn-compatible Model Tree; RHM differs in that its feature selection is coefficient-driven rather than criterion-driven, which we examine in detail.
+
+The remainder of this paper is structured as follows. Section~\ref{sec:related} reviews the Linear Model Tree literature and positions RHM within it. Section~\ref{sec:algorithm} gives a precise algorithmic description. Section~\ref{sec:complexity} analyses complexity. Section~\ref{sec:setup} describes the experimental setup. Section~\ref{sec:results} reports results. Section~\ref{sec:discussion} discusses limitations and future directions, and Section~\ref{sec:conclusion} concludes.
+
+\section{Related Work}\label{sec:related}
+
+The RHM belongs to the Linear Model Tree (LMT) family. We review the main prior algorithms and clarify where RHM sits within this space.
+
+\paragraph{CART \citep{breiman1984}.} The foundational regression tree assigns a constant (mean of targets) at each leaf and selects splits by exhaustive search over all features and thresholds to minimise within-node MSE. RHM replaces the constant leaf with a Ridge model and the exhaustive feature search with a coefficient-guided heuristic.
+
+\paragraph{M5 and M5' \citep{quinlan1992,wang1997}.} M5 is the canonical Model Tree algorithm. It grows the tree structure using a standard variance-reduction criterion and then, once the structure is fixed, re-fits linear models at the leaves and applies M5'-style smoothing across node boundaries to improve continuity. RHM differs in three ways: (1)~Ridge regression is used rather than OLS, providing $L_2$ regularisation at the leaf level; (2)~feature selection uses coefficient magnitudes rather than variance reduction; (3)~no post-hoc smoothing is applied. RHM is therefore simpler but less polished than M5'.
+
+\paragraph{PILOT \citep{raymaekers2024}.} PILOT is a recent, theoretically grounded LMT with the same asymptotic complexity as CART. It selects features using an $L_2$-boosting approach---fitting a univariate piecewise linear model and passing residuals to child nodes---rather than fitting a full multivariate Ridge at each node. PILOT also applies truncation to mitigate extrapolation. Relative to PILOT, RHM fits a full multivariate Ridge for feature selection (more expensive per node but uses all features jointly) and fits independent Ridge models at each child rather than boosting residuals.
+
+\paragraph{PINE \citep{li2024}.} PINE is a performance-oriented LMT that uses Ridge regression at both internal nodes and leaves, GPU-accelerated histogram construction, and prediction bounding. PINE is the closest existing algorithm to RHM in terms of the leaf estimator (Ridge) and the use of Ridge at internal nodes for splitting. The primary distinction is that PINE evaluates split quality via a full MSE search over all features and binned thresholds, whereas RHM uses coefficient magnitude to pre-select a single feature and then scans a coarser percentile grid.
+
+\paragraph{\texttt{linear-tree} \citep{cerlymarco2021}.} An open-source Python package providing scikit-learn-compatible LMT implementations with pluggable linear estimators (including Ridge). It evaluates splits by fitting the chosen linear model on both child partitions and computing a criterion score, similar in spirit to RHM's Step~B but with an exhaustive feature search. RHM's coefficient-guided Step~A is the key difference.
+
+\paragraph{Piecewise Linear Regression and MARS.} Friedman's MARS \citep{friedman1991} constructs a piecewise linear function using spline basis functions chosen greedily, without an explicit tree structure. Threshold regression \citep{hansen2000} estimates break-points in econometric linear models. These methods share the piecewise-linear spirit but differ structurally from tree-based partitioning.
+
+\paragraph{Summary of positioning.} RHM is a minimal, interpretable LMT distinguished by its coefficient-guided feature selection heuristic. It is not claimed to outperform PILOT, PINE, or the \texttt{linear-tree} library on general benchmarks; rather, it offers a transparent, analysable design that illuminates the trade-off between exhaustive feature search and coefficient-proxy selection. This makes it a useful pedagogical and research baseline for studying feature selection strategies within the LMT family.
+
+\section{Algorithm}\label{sec:algorithm}
+
+We now describe the RHM algorithm in full detail, covering data structures, tree construction, split optimisation, and inference.
+
+\subsection{Data Structures}
+
+The model is represented as a binary tree of \texttt{HybridNode} objects. Each node stores:
+\begin{itemize}
+    \item \texttt{feature}---the name of the splitting feature (\texttt{None} for leaf nodes);
+    \item \texttt{split\_point}---the threshold value $\tau$ such that samples with $\texttt{feature} \leq \tau$ route left (\texttt{None} for leaf nodes);
+    \item \texttt{left}, \texttt{right}---child \texttt{HybridNode} references (\texttt{None} for leaf nodes);
+    \item \texttt{model}---a fitted Ridge regression object (\texttt{None} for internal nodes).
+\end{itemize}
+A node is a leaf if and only if its \texttt{model} attribute is not \texttt{None}. Internal nodes have no model and perform routing only.
+
+\subsection{Tree Construction: \texttt{fit(X, y)}}
+
+The public interface follows the scikit-learn estimator convention: \texttt{fit(X, y)} stores the fitted tree in \texttt{self.root} and returns \texttt{self}. Internally, it delegates to a recursive procedure \texttt{\_build\_tree(X, y, depth)} (Algorithm~1) which constructs the tree top-down starting at $\texttt{depth} = 0$.
+
+\medskip
+\noindent\fbox{\parbox{0.96\textwidth}{
+\textbf{Algorithm 1:} RHM.\_build\_tree($X, y, \text{depth}$)\label{alg:fit}\\[4pt]
+\textbf{Input:} $X \in \mathbb{R}^{n \times d}$, $y \in \mathbb{R}^n$, $\text{depth} \in \mathbb{N}$ \quad
+\textbf{Output:} \texttt{HybridNode} (root of subtree)\\[4pt]
+1. \textbf{if} $\text{depth} \geq \text{max\_depth}$ \textbf{or} $n < \text{min\_samples\_split}$ \textbf{then}\\
+2. \quad $m \leftarrow \text{Ridge}(\alpha\!=\!1.0).\text{fit}(X, y)$\\
+3. \quad \textbf{return} \texttt{HybridNode}($\text{model}\!=\!m$) \hfill $\triangleright$ leaf\\[2pt]
+\quad \emph{// Step A: feature selection via Ridge coefficients}\\
+4. $m_{\text{node}} \leftarrow \text{Ridge}(\alpha\!=\!1.0).\text{fit}(X, y)$\\
+5. $j^* \leftarrow \arg\max_j |m_{\text{node}}.\text{coef\_}[j]|$ \hfill $\triangleright$ most significant feature\\[2pt]
+\quad \emph{// Step B: split-point search over percentile grid}\\
+6. $P \leftarrow \{p_{10}, p_{20}, \ldots, p_{90}\}$ of $X[:, j^*]$ \hfill $\triangleright$ 9 candidates\\
+7. $\text{best\_mse} \leftarrow \infty$;\; $\text{best\_}\tau \leftarrow \texttt{None}$\\
+8. \textbf{for each} $\tau \in P$ \textbf{do}\\
+9. \quad $L \leftarrow \{i : X[i, j^*] \leq \tau\}$;\; $R \leftarrow$ complement\\
+10. \quad \textbf{if} $|L| < \text{min\_samples\_split}$ \textbf{or} $|R| < \text{min\_samples\_split}$: \textbf{continue}\\
+11. \quad $m_L \leftarrow \text{Ridge}(\alpha\!=\!1.0).\text{fit}(X[L], y[L])$\\
+12. \quad $m_R \leftarrow \text{Ridge}(\alpha\!=\!1.0).\text{fit}(X[R], y[R])$\\
+13. \quad $\text{mse} \leftarrow (|L| \cdot \text{MSE}(y[L], m_L(X[L])) + |R| \cdot \text{MSE}(y[R], m_R(X[R]))) / n$\\
+14. \quad \textbf{if} $\text{mse} < \text{best\_mse}$: $\text{best\_mse} \leftarrow \text{mse}$;\; $\text{best\_}\tau \leftarrow \tau$\\
+15. \textbf{if} $\text{best\_}\tau = \texttt{None}$: \textbf{return} \texttt{HybridNode}($\text{model}\!=\!m_{\text{node}}$) \hfill $\triangleright$ fallback leaf\\[2pt]
+\quad \emph{// Step C: partition and recurse}\\
+16. $L^* \leftarrow \{i : X[i, j^*] \leq \text{best\_}\tau\}$;\; $R^* \leftarrow$ complement\\
+17. $\text{left} \leftarrow \text{\_build\_tree}(X[L^*], y[L^*], \text{depth}+1)$\\
+18. $\text{right} \leftarrow \text{\_build\_tree}(X[R^*], y[R^*], \text{depth}+1)$\\
+19. \textbf{return} \texttt{HybridNode}($\text{feature}\!=\!j^*$, $\text{split\_point}\!=\!\text{best\_}\tau$, $\text{left}\!=\!\text{left}$, $\text{right}\!=\!\text{right}$)
+}}\medskip
+
+\subsection{Step A: Feature Selection via Ridge Coefficients}
+
+Rather than evaluating all $d$ features as splitting candidates (as CART does, with $O(nd \log n)$ cost per level), RHM first fits a Ridge regression to the current partition to obtain a global linear signal. The feature with the largest absolute coefficient magnitude, $j^* = \arg\max_j |\beta_j|$, is selected as the splitting feature. This heuristic is motivated by the assumption that the feature that dominates the global linear signal within the current region is the most informative axis along which to further partition the space.
+
+A key advantage is computational efficiency: feature selection reduces to a single Ridge fit plus an argmax, costing $O(nd^2)$ rather than $O(nd^2 \times d)$. The Ridge regularisation ($\alpha = 1.0$) also guards against coefficient inflation under multicollinearity, making the selection more stable than with OLS.
+
+\subsection{Step B: Split-Point Optimisation}
+
+Given splitting feature $j^*$, the optimal split threshold $\tau^*$ is found by scanning a fixed grid of 9 candidate values---the 10th through 90th percentiles of $X[:, j^*]$ in steps of 10 (lines~10--21 of Algorithm~1). For each candidate $\tau$:
+\begin{enumerate}
+    \item The node samples are partitioned into a left set $L = \{i : X[i, j^*] \leq \tau\}$ and right set $R = \{i : X[i, j^*] > \tau\}$.
+    \item A Ridge model is fitted independently on each partition.
+    \item The weighted MSE criterion is computed:
+    \[
+        \text{MSE}(\tau) = \frac{|L| \cdot \text{MSE}_L + |R| \cdot \text{MSE}_R}{n}
+    \]
+    where $\text{MSE}_L$ and $\text{MSE}_R$ are the mean squared errors of the fitted models on their respective partitions.
+\end{enumerate}
+This criterion is a sample-weighted average of the two residual variances and is analogous to the impurity-reduction criterion in CART but evaluated on Ridge-fitted residuals rather than pure variance.
+
+A split is admissible only if both $L$ and $R$ have at least \texttt{min\_samples\_split} samples. If no admissible split is found for any $\tau$ in the grid, the current node becomes a leaf.
+
+The percentile grid avoids extreme splits (below $p_{10}$ or above $p_{90}$) that would create highly imbalanced partitions. Using 9 fixed percentile thresholds rather than all unique values gives a significant speed-up while retaining good granularity in practice.
+
+\subsection{Step C: Recursion and Termination}
+
+Once the best split $(j^*, \tau^*)$ is determined, the algorithm recurses on the two child partitions at $\text{depth} + 1$. Recursion terminates when either:
+\begin{enumerate}
+    \item[(a)] $\text{depth} \geq \text{max\_depth}$: the maximum allowable tree depth is reached, or
+    \item[(b)] $n < \text{min\_samples\_split}$: the partition contains fewer samples than the minimum required to attempt a split.
+\end{enumerate}
+Both conditions create a leaf node: a Ridge model is fitted on the local partition and stored in the node. During inference, all samples that reach this leaf will be predicted by this local model.
+
+\subsection{Inference: \texttt{predict(X)}}
+
+Algorithm~2 describes prediction for a new sample $x \in \mathbb{R}^d$.
+
+\medskip
+\noindent\fbox{\parbox{0.96\textwidth}{
+\textbf{Algorithm 2:} RHM.predict($x$)\label{alg:predict}\\[4pt]
+\textbf{Input:} $x \in \mathbb{R}^d$ (single test sample) \quad
+\textbf{Output:} $\hat{y} \in \mathbb{R}$\\[4pt]
+1. $\text{node} \leftarrow \text{root}$\\
+2. \textbf{while} $\text{node.model}$ is \texttt{None} \textbf{do}\\
+3. \quad \textbf{if} $x[\text{node.feature}] \leq \text{node.split\_point}$ \textbf{then}\\
+4. \quad\quad $\text{node} \leftarrow \text{node.left}$\\
+5. \quad \textbf{else}\\
+6. \quad\quad $\text{node} \leftarrow \text{node.right}$\\
+7. \textbf{return} $\text{node.model.predict}(x)$
+}}\medskip
+
+For a dataset of $m$ test samples, Algorithm~\ref{alg:predict} is applied independently to each row. The prediction is fully deterministic and interpretable: one can trace the exact sequence of binary decisions that led to the leaf model used.
+
+\subsection{Structural Properties}
+
+\paragraph{Piecewise linearity.} The function $f: \mathbb{R}^d \to \mathbb{R}$ computed by RHM is piecewise linear. The feature space is partitioned into at most $2^{\text{max\_depth}}$ axis-aligned hyper-rectangular regions, and on each region $f$ is an affine function (the leaf Ridge model).
+
+\paragraph{Continuity.} RHM does not enforce continuity at region boundaries. Adjacent leaf models may predict different values for the same input placed exactly at a split threshold---a standard characteristic of hard-routing trees. In the special case of a purely quadratic target with symmetric midpoint splits and population-level Ridge fits, adjacent leaf models happen to agree exactly at their shared boundary (see the analytical examples in Section~\ref{sec:example}). On finite samples with regularisation and percentile-grid splits, small discontinuities will generally arise.
+
+\paragraph{Interpretability.} Each leaf is associated with a human-readable decision path (a conjunction of threshold comparisons) and a set of $d + 1$ interpretable coefficients from its Ridge model.
+
+\subsection{Numerical Example}\label{sec:example}
+
+To build intuition, we analyse the RHM algorithm on idealised problems where the population-level Ridge fits admit closed-form solutions. The coefficients and error bounds below are \emph{analytical} (computed from the continuous data distribution, not from finite samples); the implemented algorithm approximates these values on sampled data with regularisation.
+
+\paragraph{Setup.} Consider $x$ drawn uniformly from $[-3, 3]$ with a single feature ($d=1$) and target
+\[
+    y = 2x + x^2.
+\]
+The true function is a parabola---globally non-linear, but locally well-approximated by straight lines. We apply RHM with $\text{max\_depth} = 1$.
+
+\paragraph{Step A: Feature selection.} With $d=1$ feature, the Ridge fit at the root returns a single coefficient $\hat{\beta}_1$. Since there is only one candidate, $j^* = x$ is selected automatically. The population-level Ridge fit (dashed line in Figure~\ref{fig:example}) is $\hat{y} = 2x + 3$ (slope equals the linear coefficient; intercept equals $\mathbb{E}[x^2] = 3$). This captures the linear trend but systematically misses the curvature.
+
+\paragraph{Step B: Split-point search.} Scanning the percentile grid, the weighted MSE is minimised at $\tau^* = 0.0$ (the median), which splits the parabola at its vertex---the point of maximum curvature.
+
+\paragraph{Step C: Leaf models.} Two Ridge models are fitted (using the closed-form population-level coefficients derived in the convergence analysis below):
+\begin{itemize}
+    \item \textbf{Left leaf} ($x \leq 0$): $\hat{y}_L = -x - 1.5$. On the left half, the negative slope of the linear term and the positive curvature of $x^2$ partially cancel, producing a negative slope.
+    \item \textbf{Right leaf} ($x > 0$): $\hat{y}_R = 5x - 1.5$. On the right half, both terms are increasing, yielding a steep positive slope.
+\end{itemize}
+
+\paragraph{Result.} The piecewise linear approximation (solid lines in Figure~\ref{fig:example}) tracks the parabola much more closely than the global Ridge fit. The maximum pointwise error drops from $6.0$ (global Ridge at the endpoints) to $1.5$ (RHM, depth 1)---a $4\times$ reduction---because each leaf adapts its slope to the local regime.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=0.85\textwidth,
+    height=0.55\textwidth,
+    xlabel={$x$},
+    ylabel={$y$},
+    xmin=-3.5, xmax=3.5,
+    ymin=-4, ymax=16,
+    grid=major,
+    grid style={gray!30},
+    legend style={at={(0.03,0.97)}, anchor=north west, font=\small},
+    tick label style={font=\small},
+    label style={font=\small},
+]
+
+% True function: y = 2x + x^2
+\addplot[
+    domain=-3.2:3.2,
+    samples=80,
+    thick,
+    black,
+] {2*x + x^2};
+\addlegendentry{True: $y = 2x + x^2$}
+
+% Global Ridge fit: y = 2x + 3 (population-level: slope=2, intercept=E[x^2]=3)
+\addplot[
+    domain=-3.2:3.2,
+    samples=2,
+    dashed,
+    thick,
+    gray,
+] {2*x + 3};
+\addlegendentry{Global Ridge: $\hat{y} = 2x + 3$}
+
+% Left leaf: y = -x - 1.5  (population Ridge on [-3,0])
+\addplot[
+    domain=-3.2:0,
+    samples=2,
+    thick,
+    blue,
+] {-1*x - 1.5};
+\addlegendentry{Left leaf: $\hat{y}_L = -x - 1.5$}
+
+% Right leaf: y = 5x - 1.5  (population Ridge on [0,3])
+\addplot[
+    domain=0:3.2,
+    samples=2,
+    thick,
+    red,
+] {5*x - 1.5};
+\addlegendentry{Right leaf: $\hat{y}_R = 5x - 1.5$}
+
+% Split point indicator
+\draw[densely dotted, thick, black!60] (axis cs:0,-4) -- (axis cs:0,16);
+\node[font=\small, anchor=south west] at (axis cs:0.1,14) {$\tau^* = 0$};
+
+\end{axis}
+\end{tikzpicture}
+\caption{Analytical example with $d=1$ and $y = 2x + x^2$. The global Ridge fit (dashed grey) captures only the average linear trend. RHM with $\text{max\_depth}=1$ splits at $\tau^* = 0$ and fits population-level Ridge models on each half (blue, red), reducing the maximum pointwise error by $4\times$ relative to the global fit. All coefficients are closed-form population values.}\label{fig:example}
+\end{figure}
+
+This example illustrates the core mechanism: RHM identifies the axis of greatest variation (here the only feature), finds the split point that best separates distinct linear regimes, and fits local models that together approximate the non-linear surface far more accurately than any single linear model.
+
+\paragraph{Convergence with increasing depth.}
+The depth-1 example above shows a single split reducing MSE by 87\%. A natural question is: how does the approximation improve as we continue splitting? Figure~\ref{fig:depth_progression} answers this by showing the piecewise linear approximation of $y = 2x + x^2$ on $[-3,3]$ at depths 1 through 4, producing 2, 4, 8, and 16 leaf segments respectively.
+
+On each segment $[a,b]$ of width $h = b - a$, the population-level Ridge fit has a closed-form solution: slope $\hat{\beta} = 2 + a + b$ (the average derivative of $2x + x^2$ on $[a,b]$) and intercept $\hat{\beta}_0 = -(a^2 + 4ab + b^2)/6$. A notable property of this idealised setting emerges: \emph{adjacent leaf models agree exactly at their shared boundary}. That is, for any two neighbouring segments $[a,m]$ and $[m,b]$ with $m = (a+b)/2$, the left and right Ridge fits predict the same value at $x = m$. The piecewise approximation is therefore continuous---a polygon that wraps smoothly around the parabola with no gaps at the split points. (On finite samples, small discontinuities will generally be present; see Section~\ref{sec:algorithm}, Structural Properties.)
+
+\begin{figure}[ht]
+\centering
+\begin{minipage}[t]{0.48\textwidth}
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=\textwidth, height=0.7\textwidth,
+    xlabel={$x$}, ylabel={$y$},
+    xmin=-3.3, xmax=3.3, ymin=-2.5, ymax=16,
+    grid=major, grid style={gray!20},
+    tick label style={font=\scriptsize},
+    label style={font=\small},
+    title={\small Depth 1 \quad (2 leaves)},
+    title style={font=\small},
+    legend style={at={(0.03,0.97)}, anchor=north west, font=\tiny},
+]
+\addplot[domain=-3.2:3.2, samples=80, thick, black] {2*x + x^2};
+\addlegendentry{True}
+\addplot[thick, blue] coordinates {
+    (-3, 1.5) (0, -1.5) (3, 13.5)
+};
+\addlegendentry{RHM}
+\node[font=\tiny, blue, anchor=west] at (axis cs:0.2,9) {$\varepsilon_{\max} = 1.50$};
+\end{axis}
+\end{tikzpicture}
+\end{minipage}\hfill
+\begin{minipage}[t]{0.48\textwidth}
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=\textwidth, height=0.7\textwidth,
+    xlabel={$x$}, ylabel={$y$},
+    xmin=-3.3, xmax=3.3, ymin=-2.5, ymax=16,
+    grid=major, grid style={gray!20},
+    tick label style={font=\scriptsize},
+    label style={font=\small},
+    title={\small Depth 2 \quad (4 leaves)},
+    title style={font=\small},
+    legend style={at={(0.03,0.97)}, anchor=north west, font=\tiny},
+]
+\addplot[domain=-3.2:3.2, samples=80, thick, black] {2*x + x^2};
+\addlegendentry{True}
+\addplot[thick, blue] coordinates {
+    (-3, 2.625) (-1.5, -1.125) (0, -0.375) (1.5, 4.875) (3, 14.625)
+};
+\addlegendentry{RHM}
+\node[font=\tiny, blue, anchor=west] at (axis cs:0.2,9) {$\varepsilon_{\max} = 0.375$};
+\end{axis}
+\end{tikzpicture}
+\end{minipage}
+
+\vspace{6pt}
+
+\begin{minipage}[t]{0.48\textwidth}
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=\textwidth, height=0.7\textwidth,
+    xlabel={$x$}, ylabel={$y$},
+    xmin=-3.3, xmax=3.3, ymin=-2.5, ymax=16,
+    grid=major, grid style={gray!20},
+    tick label style={font=\scriptsize},
+    label style={font=\small},
+    title={\small Depth 3 \quad (8 leaves)},
+    title style={font=\small},
+    legend style={at={(0.03,0.97)}, anchor=north west, font=\tiny},
+]
+\addplot[domain=-3.2:3.2, samples=80, thick, black] {2*x + x^2};
+\addlegendentry{True}
+\addplot[thick, blue] coordinates {
+    (-3, 2.906) (-2.25, 0.469) (-1.5, -0.844)
+    (-0.75, -1.031) (0, -0.094) (0.75, 1.969)
+    (1.5, 5.156) (2.25, 9.469) (3, 14.906)
+};
+\addlegendentry{RHM}
+\node[font=\tiny, blue, anchor=west] at (axis cs:0.2,9) {$\varepsilon_{\max} = 0.094$};
+\end{axis}
+\end{tikzpicture}
+\end{minipage}\hfill
+\begin{minipage}[t]{0.48\textwidth}
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=\textwidth, height=0.7\textwidth,
+    xlabel={$x$}, ylabel={$y$},
+    xmin=-3.3, xmax=3.3, ymin=-2.5, ymax=16,
+    grid=major, grid style={gray!20},
+    tick label style={font=\scriptsize},
+    label style={font=\small},
+    title={\small Depth 4 \quad (16 leaves)},
+    title style={font=\small},
+    legend style={at={(0.03,0.97)}, anchor=north west, font=\tiny},
+]
+\addplot[domain=-3.2:3.2, samples=80, thick, black] {2*x + x^2};
+\addlegendentry{True}
+\addplot[thick, blue] coordinates {
+    (-3, 2.977) (-2.625, 1.617) (-2.25, 0.539)
+    (-1.875, -0.258) (-1.5, -0.773) (-1.125, -1.008)
+    (-0.75, -0.961) (-0.375, -0.633) (0, -0.023)
+    (0.375, 0.867) (0.75, 2.039) (1.125, 3.492)
+    (1.5, 5.227) (1.875, 7.242) (2.25, 9.539)
+    (2.625, 12.117) (3, 14.977)
+};
+\addlegendentry{RHM}
+\node[font=\tiny, blue, anchor=west] at (axis cs:0.2,9) {$\varepsilon_{\max} = 0.023$};
+\end{axis}
+\end{tikzpicture}
+\end{minipage}
+\caption{Piecewise linear approximation of $y = 2x + x^2$ at increasing tree depth. At each depth $k$, the interval $[-3,3]$ is partitioned into $2^k$ segments. The approximation (blue polyline) wraps progressively tighter around the true parabola (black curve), with no discontinuities at segment boundaries. The maximum error $\varepsilon_{\max}$ decreases by a factor of 4 with each depth level.}\label{fig:depth_progression}
+\end{figure}
+
+The maximum approximation error on each segment is $h^2/6$, where $h$ is the segment width. Since each depth level halves $h$, the error decreases by a factor of four per level (Table~\ref{tab:convergence}). This is the classical $O(h^2)$ convergence rate of piecewise linear approximation applied to smooth ($C^2$) functions.
+
+\begin{table}[ht]
+\centering
+\caption{Convergence of the piecewise linear approximation with tree depth.}\label{tab:convergence}
+\begin{tabular}{ccccc}
+\toprule
+\textbf{Depth} & \textbf{Leaves} & \textbf{Segment width $h$} & \textbf{Max error $h^2/6$} & \textbf{Reduction} \\
+\midrule
+1 & 2  & 3.000 & 1.500 & --- \\
+2 & 4  & 1.500 & 0.375 & $4\times$ \\
+3 & 8  & 0.750 & 0.094 & $4\times$ \\
+4 & 16 & 0.375 & 0.023 & $4\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The continuity at boundaries is a consequence of the symmetry of the quadratic: when a segment is split at its midpoint, the two child Ridge fits yield identical predictions at the split point. This property holds exactly for quadratic targets and approximately for smooth functions with moderate higher-order derivatives.
+
+\paragraph{Extension to two dimensions.}
+For the separable function $y = 3x_1 - 2x_2 + x_1^2 + x_2^2$, the same convergence applies independently along each axis. Figure~\ref{fig:partition_2d} shows the partition of $[-2,2]^2$ produced by RHM at depth~2. The algorithm adapts its splitting axis at each node based on the Ridge coefficients: the root splits on $x_1$ (since $|\hat{\beta}_1| = 3 > |\hat{\beta}_2| = 2$); the left child, where the quadratic $x_1^2$ has reduced $|\hat{\beta}_1|$ to~1, switches to splitting on $x_2$ ($|\hat{\beta}_2| = 2$ now dominates); the right child, where $x_1^2$ has amplified $|\hat{\beta}_1|$ to~5, continues splitting on $x_1$.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[scale=1.1]
+% Outer rectangle
+\draw[thick] (-3,-3) rectangle (3,3);
+
+% Axis labels
+\node[below] at (0,-3.3) {$x_1$};
+\node[left] at (-3.3,0) {$x_2$};
+
+% Tick marks and labels
+\foreach \v/\l in {-3/-2, 0/0, 3/2} {
+    \node[below, font=\scriptsize] at (\v,-3) {\l};
+    \node[left, font=\scriptsize] at (-3,\v) {\l};
+}
+\node[below, font=\scriptsize] at (1.5,-3) {1};
+
+% Split lines
+\draw[thick, dashed] (0,-3) -- (0,3);        % root split: x1 = 0
+\draw[thick, dashed] (-3,0) -- (0,0);         % left child split: x2 = 0
+\draw[thick, dashed] (1.5,-3) -- (1.5,3);     % right child split: x1 = 1
+
+% Region shading
+\fill[blue!8] (-3,-3) rectangle (0,0);
+\fill[blue!16] (-3,0) rectangle (0,3);
+\fill[red!8] (0,-3) rectangle (1.5,3);
+\fill[red!16] (1.5,-3) rectangle (3,3);
+
+% Region labels
+\node[font=\small, align=center] at (-1.5,-1.5) {Leaf A\\[2pt]$\hat{y} = x_1 - 4x_2 - \tfrac{4}{3}$};
+\node[font=\small, align=center] at (-1.5,1.5) {Leaf B\\[2pt]$\hat{y} = x_1 - \tfrac{4}{3}$};
+\node[font=\small, align=center] at (0.75,0) {Leaf C\\[2pt]$\hat{y} = 4x_1 - 2x_2 + \tfrac{7}{6}$};
+\node[font=\small, align=center] at (2.25,0) {Leaf D\\[2pt]$\hat{y} = 6x_1 - 2x_2 - \tfrac{5}{6}$};
+
+% Split annotations
+\node[font=\scriptsize, anchor=south] at (0,3.1) {$x_1 = 0$};
+\node[font=\scriptsize, anchor=south east] at (-0.1,0.1) {$x_2 = 0$};
+\node[font=\scriptsize, anchor=south] at (1.5,3.1) {$x_1 = 1$};
+
+\end{tikzpicture}
+\caption{Partition of $[-2,2]^2$ by RHM at depth~2 for $y = 3x_1 - 2x_2 + x_1^2 + x_2^2$. The root splits on $x_1$ at~0. The left child splits on $x_2$ at~0 (where $x_2$ dominates after the $x_1^2$ curvature reduces $|\hat{\beta}_1|$). The right child splits on $x_1$ at~1 (where $x_1$ still dominates). Each leaf shows its fitted Ridge plane. The adaptive axis selection at each node is a distinguishing feature of the coefficient-guided heuristic.}\label{fig:partition_2d}
+\end{figure}
+
+With increasing depth, the tree continues to subdivide each region along the axis with the largest Ridge coefficient, producing smaller rectangular cells whose Ridge planes approximate the paraboloid with $O(h^2)$ error in each axis.
+
+\paragraph{Surface approximation with 32 leaf planes.}
+Figure~\ref{fig:surface_comparison} demonstrates this convergence in two dimensions. We partition $[-2,2]^2$ into an $8 \times 4$ grid of 32 rectangular cells---equivalent to a depth-5 tree with alternating axis splits (5 levels produce $2^5 = 32$ leaves, distributed as 8 strips in $x_1$ and 4 strips in $x_2$). On each cell $[a_1, b_1] \times [a_2, b_2]$, the Ridge fit has closed-form coefficients:
+\[
+    \hat{\beta}_1 = 3 + a_1 + b_1, \quad \hat{\beta}_2 = -2 + a_2 + b_2, \quad \hat{\beta}_0 = -\tfrac{a_1^2 + 4a_1 b_1 + b_1^2}{6} - \tfrac{a_2^2 + 4a_2 b_2 + b_2^2}{6}.
+\]
+Because the target is separable, adjacent cells produce Ridge planes that \emph{agree exactly at their shared boundary}---the 32-plane surface is fully continuous. The maximum error is $h_1^2/6 + h_2^2/6 \approx 0.042 + 0.167 = 0.21$ (with $h_1 = 0.5$ in $x_1$, $h_2 = 1.0$ in $x_2$).
+
+\begin{figure}[ht]
+\centering
+\begin{minipage}[t]{0.48\textwidth}
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=\textwidth, height=0.85\textwidth,
+    view={-40}{30},
+    xlabel={$x_1$}, ylabel={$x_2$}, zlabel={$y$},
+    title={\small True surface},
+    title style={at={(0.5,1.0)}, font=\small},
+    colormap/viridis,
+    tick label style={font=\scriptsize},
+    label style={font=\small},
+    zmin=-4, zmax=19,
+]
+\addplot3[
+    surf, shader=interp,
+    domain=-2:2, domain y=-2:2,
+    samples=33, opacity=0.9,
+] {3*x - 2*y + x^2 + y^2};
+\end{axis}
+\end{tikzpicture}
+\end{minipage}\hfill
+\begin{minipage}[t]{0.48\textwidth}
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=\textwidth, height=0.85\textwidth,
+    view={-40}{30},
+    xlabel={$x_1$}, ylabel={$x_2$}, zlabel={$\hat{y}$},
+    title={\small RHM approximation (32 leaves)},
+    title style={at={(0.5,1.0)}, font=\small},
+    colormap/viridis,
+    tick label style={font=\scriptsize},
+    label style={font=\small},
+    zmin=-4, zmax=19,
+]
+\addplot3[
+    surf, shader=interp,
+    domain=-2:2, domain y=-2:2,
+    samples=33, opacity=0.9,
+] {%
+    ((x<-1.5)*(-0.5*x - 3.0417)
+    + (x>=-1.5)*(x<-1)*(0.5*x - 1.5417)
+    + (x>=-1)*(x<-0.5)*(1.5*x - 0.5417)
+    + (x>=-0.5)*(x<0)*(2.5*x - 0.0417)
+    + (x>=0)*(x<0.5)*(3.5*x - 0.0417)
+    + (x>=0.5)*(x<1)*(4.5*x - 0.5417)
+    + (x>=1)*(x<1.5)*(5.5*x - 1.5417)
+    + (x>=1.5)*(6.5*x - 3.0417))
+    +
+    ((y<-1)*(-5*y - 2.1667)
+    + (y>=-1)*(y<0)*(-3*y - 0.1667)
+    + (y>=0)*(y<1)*(-1*y - 0.1667)
+    + (y>=1)*(1*y - 2.1667))
+};
+% Grid lines on the surface at x1 = -1, 0, 1 (major)
+\addplot3[black, thin, dashed] coordinates {
+    (-1,-2,5.79) (-1,-1,0.79) (-1,0,-2.21) (-1,1,-3.21) (-1,2,-2.21)};
+\addplot3[black, thin, dashed] coordinates {
+    (0,-2,7.79) (0,-1,2.79) (0,0,-0.21) (0,1,-1.21) (0,2,-0.21)};
+\addplot3[black, thin, dashed] coordinates {
+    (1,-2,11.79) (1,-1,6.79) (1,0,3.79) (1,1,2.79) (1,2,3.79)};
+% Grid lines at x1 = -1.5, -0.5, 0.5, 1.5 (fine)
+\addplot3[black!50, very thin, densely dotted] coordinates {
+    (-1.5,-2,5.54) (-1.5,-1,0.54) (-1.5,0,-2.46) (-1.5,1,-3.46) (-1.5,2,-2.46)};
+\addplot3[black!50, very thin, densely dotted] coordinates {
+    (-0.5,-2,6.54) (-0.5,-1,1.54) (-0.5,0,-1.46) (-0.5,1,-2.46) (-0.5,2,-1.46)};
+\addplot3[black!50, very thin, densely dotted] coordinates {
+    (0.5,-2,9.54) (0.5,-1,4.54) (0.5,0,1.54) (0.5,1,0.54) (0.5,2,1.54)};
+\addplot3[black!50, very thin, densely dotted] coordinates {
+    (1.5,-2,14.54) (1.5,-1,9.54) (1.5,0,6.54) (1.5,1,5.54) (1.5,2,6.54)};
+% Grid lines at x2 = -1, 0, 1
+\addplot3[black, thin, dashed] coordinates {
+    (-2,-1,0.79) (-1.5,-1,0.54) (-1,-1,0.79) (-0.5,-1,1.54)
+    (0,-1,2.79) (0.5,-1,4.54) (1,-1,6.79) (1.5,-1,9.54) (2,-1,12.79)};
+\addplot3[black, thin, dashed] coordinates {
+    (-2,0,-2.21) (-1.5,0,-2.46) (-1,0,-2.21) (-0.5,0,-1.46)
+    (0,0,-0.21) (0.5,0,1.54) (1,0,3.79) (1.5,0,6.54) (2,0,9.79)};
+\addplot3[black, thin, dashed] coordinates {
+    (-2,1,-3.21) (-1.5,1,-3.46) (-1,1,-3.21) (-0.5,1,-2.46)
+    (0,1,-1.21) (0.5,1,0.54) (1,1,2.79) (1.5,1,5.54) (2,1,8.79)};
+\end{axis}
+\end{tikzpicture}
+\end{minipage}
+\caption{True surface $y = 3x_1 - 2x_2 + x_1^2 + x_2^2$ (left) and RHM piecewise planar approximation with 32 leaves on an $8\!\times\!4$ grid (right). Dashed lines mark the $4\!\times\!4$ major cell boundaries; dotted lines mark the finer $x_1$ subdivisions. The 32 Ridge planes are continuous across all boundaries and closely wrap the paraboloid with maximum error $\approx 0.21$.}\label{fig:surface_comparison}
+\end{figure}
+
+\paragraph{Error convergence with depth.}
+Figure~\ref{fig:error_convergence} quantifies the approximation error as a function of tree depth for both the one-dimensional ($d\!=\!1$) and two-dimensional ($d\!=\!2$) examples. In one dimension, each depth level halves the segment width $h$, reducing the maximum error $h^2/6$ by a factor of four---yielding a straight line of slope $-2$ on the log-log plot. In two dimensions with alternating axis splits, the error decreases by a factor of four every \emph{two} depth levels (since only one axis is refined per level), producing a shallower slope of $-1$ on the log-log scale. At depth 8, the one-dimensional error ($9.2 \times 10^{-5}$) and two-dimensional error ($0.021$) are both negligible relative to the function's range.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=0.7\textwidth, height=0.5\textwidth,
+    xlabel={Tree depth},
+    ylabel={Maximum approximation error},
+    ymode=log,
+    xmin=-0.3, xmax=8.5,
+    ymin=0.00005, ymax=10,
+    grid=major, grid style={gray!25},
+    tick label style={font=\small},
+    label style={font=\small},
+    legend style={at={(0.97,0.97)}, anchor=north east, font=\small},
+    xtick={0,1,2,3,4,5,6,7,8},
+]
+% 1D: error = 6 / 4^depth
+\addplot[thick, blue, mark=*, mark size=2pt] coordinates {
+    (0, 6.0) (1, 1.5) (2, 0.375) (3, 0.09375)
+    (4, 0.02344) (5, 0.005859) (6, 0.001465)
+    (7, 0.000366) (8, 0.0000916)
+};
+\addlegendentry{$d=1$: $\;\varepsilon = 6 \cdot 4^{-k}$}
+
+% 2D: alternating axis splits
+\addplot[thick, red, mark=square*, mark size=2pt] coordinates {
+    (0, 5.333) (1, 3.333) (2, 1.333) (3, 0.833)
+    (4, 0.333) (5, 0.208) (6, 0.0833)
+    (7, 0.0521) (8, 0.0208)
+};
+\addlegendentry{$d=2$: $\;\varepsilon = \tfrac{h_1^2 + h_2^2}{6}$}
+
+% Reference slope lines
+\addplot[black, dashed, thin, domain=0:8, samples=2] {6*2^(-2*x)};
+\addplot[black, dotted, thin, domain=0:8, samples=2] {5.333*2^(-x)};
+
+\node[font=\scriptsize, anchor=west] at (axis cs:5.5, 0.0003) {slope $-2$};
+\node[font=\scriptsize, anchor=west] at (axis cs:5.5, 0.07) {slope $-1$};
+
+\end{axis}
+\end{tikzpicture}
+\caption{Maximum approximation error versus tree depth for $d=1$ (blue circles) and $d=2$ (red squares) on a semi-log scale. In one dimension, each depth level reduces the error by $4\times$ (slope $-2$ on a log-log scale, shown dashed). In two dimensions with alternating axis splits, the error halves per depth level on average (slope $-1$, shown dotted), because each level refines only one axis. Both curves confirm the theoretical $O(h^2)$ convergence rate.}\label{fig:error_convergence}
+\end{figure}
+
+\section{Complexity Analysis}\label{sec:complexity}
+
+\subsection{Training Time}
+
+Let $n$ = training samples, $d$ = features, $T$ = number of nodes, $D$ = \texttt{max\_depth}. At each internal node with $n_v$ samples:
+\begin{itemize}
+    \item \textbf{Feature selection:} One Ridge fit costs $O(n_v d^2)$. Argmax over $d$ coefficients costs $O(d)$. Total: $O(n_v d^2)$.
+    \item \textbf{Split-point search:} 9 candidate splits, each requiring two Ridge fits. Cost: $O(9 \times 2 \times n_v d^2) = O(n_v d^2)$.
+\end{itemize}
+Because the left and right partitions together contain $n_v$ samples and each sample appears in exactly one partition per level, the total work per depth level is $O(nd^2)$. Across $D$ levels the total training cost is:
+\[
+    O(D \cdot n \cdot d^2)
+\]
+This is linear in depth and quadratic in features, making RHM tractable for moderate $d$ and small-to-medium $D$.
+
+\subsection{Inference Time}
+
+Each test sample traverses a path of at most $D + 1$ nodes and then executes one Ridge prediction of $O(d)$. Per-sample inference cost is $O(D + d)$. For $m$ test samples: $O(m(D + d))$.
+
+\subsection{Space Complexity}
+
+The tree contains at most $2^{D+1} - 1$ nodes. Each leaf stores a Ridge model with $O(d)$ parameters. Internal nodes store only a feature index and scalar threshold. Total space: $O(2^D \cdot d)$.
+
+\section{Experimental Setup}\label{sec:setup}
+
+\subsection{Synthetic Data Generation}
+
+To evaluate RHM in a controlled setting, we generate synthetic data with known linear, quadratic, and interaction structure. The target variable is:
+\[
+    y = 5x_1 - 3x_2 + \sum_{i=3}^{10} x_i + 0.5x_1^2 + 0.3x_2^2 + 2x_3 x_4 + \varepsilon, \quad \varepsilon \sim \mathcal{N}(0, 0.5)
+\]
+where $x_i \sim \mathcal{N}(0, 1)$ i.i.d., $n = 5{,}000$ samples, $d = 10$ features. The quadratic and interaction terms are non-linear and cannot be captured by a global linear model, making this a suitable benchmark for assessing the benefit of local partitioning.
+
+Data are split 80/20 into training and test sets. All experiments use a fixed random seed (42) for reproducibility.
+
+\subsection{Baselines and Variants}
+
+\paragraph{Baseline.} A global Ridge regression ($\alpha = 1.0$) fitted on the full training set. This represents the standard linear benchmark that RHM should outperform on non-linear data.
+
+\paragraph{RHM variants.} RHM is evaluated at $\text{max\_depth} \in \{1, 2, 3, 4\}$ with $\text{min\_samples\_split} = 100$ throughout.
+
+\subsection{Metrics}
+
+We report Mean Squared Error (MSE) and $R^2$ on both training and test sets. Lower MSE and higher $R^2$ indicate better fit.
+
+\section{Results}\label{sec:results}
+
+\subsection{Performance Summary}
+
+Table~\ref{tab:results} summarises the performance of the global Ridge baseline and RHM across depth levels.
+
+\begin{table}[ht]
+\centering
+\caption{Test and training performance of RHM vs.\ Ridge baseline.}\label{tab:results}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Model / Depth} & \textbf{Train MSE} & \textbf{Test MSE} & \textbf{Train $R^2$} & \textbf{Test $R^2$} \\
+\midrule
+Ridge (baseline) & 4.9196 & 5.2845 & 0.8951 & 0.8849 \\
+RHM, depth=1     & 4.4381 & 4.8798 & 0.9053 & 0.8938 \\
+RHM, depth=2     & 4.2716 & 4.8746 & 0.9089 & 0.8939 \\
+RHM, depth=3     & 4.1593 & 4.9433 & 0.9113 & 0.8924 \\
+RHM, depth=4     & 4.0127 & 5.0727 & 0.9144 & 0.8896 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Deeper trees capture the quadratic and interaction structure more accurately on training data, with train MSE decreasing monotonically from 4.92 (Ridge) to 4.01 (depth=4). On test data, RHM achieves its best performance at depth=2 (test MSE 4.87, $R^2$ 0.894), after which test MSE increases slightly---consistent with mild overfitting as tree depth grows and leaf partitions shrink.
+
+\subsection{Qualitative Analysis: Leaf Model Coefficients}
+
+For $\text{max\_depth} = 2$, four leaf models are fitted. Because $x_1$ has the largest Ridge coefficient at both the root and both depth-1 children (its linear coefficient of 5 dominates the other features), the tree splits on $x_1$ at all internal nodes---first near $x_1 \approx 0.0$, then near $x_1 \approx -0.8$ (left child) and $x_1 \approx 1.3$ (right child). This produces four vertical strips along the $x_1$ axis rather than a grid across two features. Exporting the leaf coefficients---available via the \texttt{collect\_coefficients} utility and \texttt{hybrid\_coefficients.csv}---reveals how the $x_1$ coefficient adapts across strips: it is smallest in the far-left partition (where $x_1 < -0.8$ and the quadratic $0.5\,x_1^2$ flattens the effective slope) and largest in the far-right partition (where $x_1 > 1.3$ and the quadratic steepens it). Coefficients on other features remain relatively stable across leaves, since the data-generating process couples non-linearity primarily to $x_1$ and $x_2$.
+
+\section{Discussion}\label{sec:discussion}
+
+\subsection{Advantages}
+
+\paragraph{Linear interpretability within regions.} Unlike CART leaves (scalar constants), RHM leaves provide a full linear equation, enabling covariate-level attribution within each region.
+
+\paragraph{Efficiency of coefficient-guided splitting.} By using Ridge coefficients to select the splitting feature, RHM avoids the $O(d)$-factor cost of CART's exhaustive feature search while still using data-driven evidence for the choice.
+
+\paragraph{Regularised leaf models.} Ridge regression at the leaves prevents overfitting of individual leaf models, particularly important when deep trees produce small partitions.
+
+\subsection{Limitations}
+
+\paragraph{Coefficient-based feature selection is a heuristic.} The feature with the largest Ridge coefficient in the current partition is not guaranteed to be the optimal splitting feature according to the MSE criterion. An exhaustive feature search would be more principled at higher computational cost.
+
+\paragraph{Fixed percentile grid.} Using 9 candidate split points ($p_{10}$--$p_{90}$) may miss optimal splits that lie between percentiles, especially for continuous features with complex distributions.
+
+\paragraph{Hard routing.} The binary decision at each internal node creates discontinuities at region boundaries. Smooth mixing (as in soft decision trees or mixture of experts) would yield a continuous predictor.
+
+\paragraph{No pruning.} The algorithm does not include post-hoc pruning or cross-validation for depth selection. Practitioners must tune \texttt{max\_depth} externally.
+
+\subsection{Future Directions}
+
+\begin{enumerate}
+    \item[(a)] Replacing the coefficient-based heuristic with a fast approximate feature search (e.g., random subset of features) for better split quality.
+    \item[(b)] Implementing M5'-style smoothing across leaf boundaries to improve continuity.
+    \item[(c)] Extending to multi-output regression by replacing Ridge with multi-output Ridge.
+    \item[(d)] Integrating cross-validated depth selection or pruning.
+\end{enumerate}
+
+\section{Conclusion}\label{sec:conclusion}
+
+We have presented the Recursive Hybrid Model (RHM), a piecewise linear regression algorithm that combines the hierarchical partitioning of decision trees with the regularised local modelling of Ridge regression. The key algorithmic contributions are: (1)~a Ridge-coefficient-guided feature selection step that avoids exhaustive feature search; (2)~a percentile-grid split-point optimisation criterion based on weighted MSE of child Ridge fits; and (3)~full Ridge models at leaves enabling linear interpretation within each region.
+
+The algorithm has training complexity $O(D \cdot n \cdot d^2)$ and inference complexity $O(m(D + d))$, making it tractable for moderate-scale problems. Empirical evaluation on synthetic data with non-linear structure confirms that RHM consistently outperforms a global Ridge baseline, with gains increasing with depth before diminishing returns set in.
+
+The method occupies a useful middle ground between interpretable linear models and complex non-parametric ensembles, and is well-suited to applications where both predictive accuracy and regional interpretability are required.
+
+\bibliographystyle{plainnat}
+
+\begin{thebibliography}{11}
+
+\bibitem[Breiman et~al.(1984)]{breiman1984}
+Breiman, L., Friedman, J., Olshen, R., \& Stone, C. (1984).
+\newblock \emph{Classification and Regression Trees}.
+\newblock Wadsworth.
+
+\bibitem[Cerlymarco(2021)]{cerlymarco2021}
+Cerlymarco. (2021).
+\newblock linear-tree: A python library to build Model Trees with Linear Models at the leaves.
+\newblock GitHub. \url{https://github.com/cerlymarco/linear-tree}
+
+\bibitem[Friedman(1979)]{friedman1979}
+Friedman, J.~H. (1979).
+\newblock A Tree-Structured Approach to Nonparametric Multiple Regression.
+\newblock In T.~Gasser \& M.~Rosenblatt (Eds.), \emph{Smoothing Techniques for Curve Estimation}, Lecture Notes in Mathematics, vol.~757. Springer.
+
+\bibitem[Friedman(1991)]{friedman1991}
+Friedman, J.~H. (1991).
+\newblock Multivariate Adaptive Regression Splines.
+\newblock \emph{The Annals of Statistics}, 19(1), 1--67.
+
+\bibitem[Hansen(2000)]{hansen2000}
+Hansen, B.~E. (2000).
+\newblock Sample Splitting and Threshold Estimation.
+\newblock \emph{Econometrica}, 68(3), 575--603.
+
+\bibitem[Hoerl \& Kennard(1970)]{hoerl1970}
+Hoerl, A.~E., \& Kennard, R.~W. (1970).
+\newblock Ridge Regression: Biased Estimation for Nonorthogonal Problems.
+\newblock \emph{Technometrics}, 12(1), 55--67.
+
+\bibitem[Li et~al.(2024)]{li2024}
+Li, Z., et~al. (2024).
+\newblock PINE: Efficient yet Effective Piecewise Linear Trees.
+\newblock \emph{SC24 Supercomputing Conference Proceedings}.
+\newblock \url{https://sc24.supercomputing.org/proceedings/poster/poster_files/post258s2-file3.pdf}
+
+\bibitem[Quinlan(1992)]{quinlan1992}
+Quinlan, J.~R. (1992).
+\newblock Learning with Continuous Classes.
+\newblock \emph{Proceedings of the 5th Australian Joint Conference on Artificial Intelligence}, pp.~343--348.
+
+\bibitem[Raymaekers et~al.(2024)]{raymaekers2024}
+Raymaekers, J., Rousseeuw, P.~J., Verdonck, T., \& Yao, R. (2024).
+\newblock Fast Linear Model Trees by PILOT.
+\newblock \emph{Machine Learning}.
+\newblock \url{https://doi.org/10.1007/s10994-024-06590-3}
+
+\bibitem[Shi et~al.(2019)]{shi2019}
+Shi, Y., et~al. (2019).
+\newblock Gradient Boosting with Piece-Wise Linear Regression Trees.
+\newblock \emph{Proceedings of the 28th International Joint Conference on Artificial Intelligence (IJCAI-19)}, pp.~3432--3438.
+
+\bibitem[Wang \& Witten(1997)]{wang1997}
+Wang, Y., \& Witten, I.~H. (1997).
+\newblock Induction of Model Trees for Predicting Continuous Classes.
+\newblock \emph{Proceedings of the European Conference on Machine Learning}, pp.~128--137.
+
+\end{thebibliography}
+
+\end{document}

@@ -1,0 +1,55 @@
+Re-review of experiment code: acgmt.py, experiments.py, utils.py, ablations.py
+
+Summary
+
+The code is materially improved. The earlier high-severity pruning bug is fixed, the full result set is now present, and the measurement code is cleaner. I do not see a new high-severity implementation bug. However, two methodological issues remain, one of them important enough to affect how the pruning results should be interpreted.
+
+Findings
+
+1. Medium: The pruning ablation is still confounded and does not isolate pruning cleanly.
+
+- In acgmt.py, setting prune=True also activates a validation split inside fit.
+- That means the tree is built on only 80% of the training data when pruning is enabled.
+- In the pruning ablation, the no-prune condition builds on the full training set, while the with-prune condition builds on a smaller effective training set and is then pruned.
+- Therefore, the comparison is not “same tree-building data, with versus without pruning.”
+- Some of the observed degradation in the pruning condition may simply come from having less data available during tree construction, not from the pruning rule itself.
+
+2. Low: Runtime comparisons against the original RHM are still partly implementation comparisons.
+
+- ACGMT uses vectorized bulk prediction.
+- The original RHM baseline still uses row-by-row pandas-based prediction.
+- Since the timing helper records both fit time and predict time, any wall-clock claim against RHM mixes algorithmic differences with engineering differences.
+- This does not invalidate the experiments, but it weakens any strong runtime narrative unless fit time and predict time are discussed separately.
+
+3. Low: The seed variation reflects dataset variation more than total model uncertainty for ensemble baselines.
+
+- The datasets are regenerated with different seeds.
+- But RandomForest and GradientBoosting are still instantiated with fixed random_state=42.
+- If the paper interprets the across-seed standard deviations as total variability of the learning procedure, that interpretation would be too strong.
+- If instead the paper states that variability comes from repeated data generation, this is acceptable.
+
+What is fixed
+
+- The pruning logic now routes validation samples correctly to each node before comparing subtree and leaf performance.
+- The previous memory-reporting issue has effectively been removed by dropping the questionable tracemalloc-based peak-memory output.
+- RandomForest now uses n_jobs=1, so the most obvious parallelism fairness issue is fixed.
+- The full comparison outputs and all four ablation outputs are now present in the results directory.
+
+Interpretation of the current results
+
+The current codebase is in much better shape, and the experimental framework is largely usable. The main remaining issue is the pruning ablation design. As it stands, the pruning results should be interpreted cautiously, because they do not cleanly attribute changes in test error to pruning alone.
+
+Recommended final fix
+
+If pruning is to be kept as a named contribution in the paper, the cleanest next step is:
+
+- hold the same build split fixed for both pruning and no-pruning conditions
+- optionally reserve the same validation split in both conditions
+- build the identical unpruned tree in both cases
+- then apply pruning only in the pruning condition
+
+That would make the pruning ablation genuinely causal rather than confounded.
+
+Bottom line
+
+The earlier serious bug is fixed. The remaining concern is methodological rather than implementation-level: pruning is still not isolated cleanly in the ablation design. Everything else now looks much closer to paper-ready.
