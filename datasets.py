@@ -1,5 +1,7 @@
 import numpy as np
 from sklearn.model_selection import train_test_split
+from sklearn.datasets import (fetch_california_housing, load_diabetes,
+                               fetch_openml, make_friedman1)
 
 
 def make_scaling_data(n_samples=5000, noise=0.5, random_state=42):
@@ -82,10 +84,85 @@ def make_regime_data(n_samples=5000, n_regimes=4, noise=0.5, random_state=42):
     return train_test_split(X, y, test_size=0.2, random_state=random_state), names
 
 
-ALL_DATASETS = {
+# ---------------------------------------------------------------------------
+# Real-world datasets
+# ---------------------------------------------------------------------------
+
+def make_california_housing(random_state=42, **kwargs):
+    """California housing prices (20k samples, 8 features)."""
+    data = fetch_california_housing()
+    X, y = data.data, data.target
+    names = list(data.feature_names)
+    return train_test_split(X, y, test_size=0.2, random_state=random_state), names
+
+
+def make_diabetes(random_state=42, **kwargs):
+    """Diabetes progression (442 samples, 10 pre-normalized features)."""
+    data = load_diabetes()
+    X, y = data.data, data.target
+    names = list(data.feature_names)
+    return train_test_split(X, y, test_size=0.2, random_state=random_state), names
+
+
+def make_concrete(random_state=42, **kwargs):
+    """Concrete compressive strength (1030 samples, 8 features)."""
+    data = fetch_openml(data_id=4353, as_frame=True, parser="auto")
+    if data.target is not None:
+        X = data.data.values.astype(float)
+        y = data.target.values.astype(float)
+        names = list(data.data.columns)
+    else:
+        # No declared target; last column is the target
+        df = data.data
+        X = df.iloc[:, :-1].values.astype(float)
+        y = df.iloc[:, -1].values.astype(float)
+        names = list(df.columns[:-1])
+    return train_test_split(X, y, test_size=0.2, random_state=random_state), names
+
+
+def make_airfoil(random_state=42, **kwargs):
+    """Airfoil self-noise (1503 samples, 5 features)."""
+    data = fetch_openml(name="airfoil_self_noise", version=1, as_frame=True, parser="auto")
+    X = data.data.values.astype(float)
+    y = data.target.values.astype(float)
+    names = list(data.data.columns)
+    return train_test_split(X, y, test_size=0.2, random_state=random_state), names
+
+
+def make_yacht(random_state=42, **kwargs):
+    """Yacht hydrodynamics (308 samples, 6 features)."""
+    data = fetch_openml(name="yacht_hydrodynamics", version=1, as_frame=True, parser="auto")
+    X = data.data.values.astype(float)
+    y = data.target.values.astype(float)
+    names = list(data.data.columns)
+    return train_test_split(X, y, test_size=0.2, random_state=random_state), names
+
+
+def make_friedman1_data(n_samples=5000, noise=0.5, random_state=42):
+    """Friedman #1: y = 10*sin(pi*x1*x2) + 20*(x3-0.5)^2 + 10*x4 + 5*x5 + noise."""
+    X, y = make_friedman1(n_samples=n_samples, n_features=10, noise=noise,
+                          random_state=random_state)
+    names = [f'x{i}' for i in range(X.shape[1])]
+    return train_test_split(X, y, test_size=0.2, random_state=random_state), names
+
+
+# ---------------------------------------------------------------------------
+
+SYNTHETIC_DATASETS = {
     'scaling': make_scaling_data,
     'correlated': make_correlated_data,
     'irrelevant': make_irrelevant_data,
     'interaction': make_interaction_data,
     'regime': make_regime_data,
+    'friedman1': make_friedman1_data,
 }
+
+REAL_DATASETS = {
+    'california': make_california_housing,
+    'diabetes': make_diabetes,
+    'concrete': make_concrete,
+    'airfoil': make_airfoil,
+    'yacht': make_yacht,
+}
+
+ALL_DATASETS = {**SYNTHETIC_DATASETS, **REAL_DATASETS}
