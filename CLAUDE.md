@@ -15,14 +15,14 @@ Both follow the scikit-learn estimator API (`fit`, `predict`, `get_params`, `set
 
 ```bash
 # Install dependencies (no setup.py/pyproject.toml — flat scripts)
-pip install numpy pandas scikit-learn matplotlib
+pip install numpy pandas scikit-learn matplotlib joblib
 
 # Run smoke tests
 python code.py          # RHM on synthetic data, outputs metrics + CSVs
 python acgmt.py         # ACGMT smoke test (3 configs, prints MSE)
 
 # Run full experiment suite
-python experiments.py        # 5 datasets x 5 seeds x 8 models -> results/comparison_*.csv
+python experiments.py        # 11 datasets x 5 seeds x 8 models -> results/comparison_*.csv (parallelized via joblib)
 python ablations.py          # Ablation studies -> results/ablation_*.csv
 python generate_summary.py   # Aggregate CSVs -> results/summary.txt
 
@@ -34,8 +34,8 @@ python code.py --auto_generate_png
 
 - `code.py` — `RecursiveHybridModel` class + `HybridNode`. Tree built via `_build_tree()`. Row-by-row prediction.
 - `acgmt.py` — `AdaptiveCoefficientGuidedModelTree` class + `ACGMTNode`. Key internal methods: `_find_best_split()` (coarse+fine grid search per feature), `_prune_tree()` / `_prune_node()` (bottom-up validation pruning), `_predict_bulk()` (vectorized prediction).
-- `datasets.py` — Five synthetic dataset factories (`make_scaling_data`, `make_correlated_data`, `make_irrelevant_data`, `make_interaction_data`, `make_regime_data`) exported via `ALL_DATASETS` dict.
-- `experiments.py` — Compares 8 models (Ridge, CART, RF, GBR, RHM, 3 ACGMT variants) across all datasets.
+- `datasets.py` — Dataset factories organized into `SYNTHETIC_DATASETS` (scaling, correlated, irrelevant, interaction, regime, friedman1) and `REAL_DATASETS` (california, diabetes, concrete, airfoil, yacht), merged into `ALL_DATASETS`. Real-world datasets are fetched via sklearn (`fetch_california_housing`, `load_diabetes`, `fetch_openml`).
+- `experiments.py` — Compares 8 models (Ridge, CART, RF, GBR, RHM, 3 ACGMT variants) across all datasets. Runs are parallelized with `joblib.Parallel`; OpenML datasets are pre-fetched to warm the cache before parallel workers start.
 - `ablations.py` — Isolates effect of each ACGMT enhancement (top-k, standardization, adaptive grid, pruning).
 - `utils.py` — `evaluate_model()`, `time_fit_predict()`, `results_to_dataframe()`, `save_results()`.
 - `generate_summary.py` — Reads CSVs from `results/`, outputs pivot tables to `results/summary.txt`.
