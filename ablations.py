@@ -17,10 +17,8 @@ def run_ablation(name, configs, seeds=(42, 123, 456, 789, 1024)):
                 model = AdaptiveCoefficientGuidedModelTree(
                     max_depth=4, min_samples_split=100, random_state=seed, **kwargs)
                 timing = time_fit_predict(model, X_train, y_train, X_test)
-                model2 = AdaptiveCoefficientGuidedModelTree(
-                    max_depth=4, min_samples_split=100, random_state=seed, **kwargs)
-                model2.fit(X_train, y_train)
-                metrics = evaluate_model(model2, X_train, y_train, X_test, y_test)
+                # model is already fitted by time_fit_predict; reuse it
+                metrics = evaluate_model(model, X_train, y_train, X_test, y_test)
                 all_results.append({
                     'dataset': ds_name, 'config': cfg_name, 'seed': seed,
                     **metrics, **timing,
